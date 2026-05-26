@@ -232,6 +232,31 @@ class ActivityRecord(models.Model):
             models.Index(fields=['organization', 'period_start', 'period_end']),
             models.Index(fields=['ingestion_run']),
         ]
+        constraints = [
+            # Period must be logically ordered
+            models.CheckConstraint(
+                check=models.Q(period_end__gte=models.F('period_start')),
+                name='chk_activity_period_end_gte_start',
+            ),
+            # Normalized quantity must be non-negative
+            # (negative raw values are preserved in quantity_raw for reversal tracking)
+            models.CheckConstraint(
+                check=models.Q(quantity_normalized__gte=0),
+                name='chk_activity_quantity_normalized_non_negative',
+            ),
+            # Scope must be 1, 2, or 3 — belt-and-suspenders beyond the CharField choices
+            models.CheckConstraint(
+                check=models.Q(scope__in=['1', '2', '3']),
+                name='chk_activity_scope_valid',
+            ),
+            # Status must be a known value
+            models.CheckConstraint(
+                check=models.Q(status__in=[
+                    'pending', 'flagged', 'approved', 'rejected', 'locked'
+                ]),
+                name='chk_activity_status_valid',
+            ),
+        ]
 
     def __str__(self):
         return f"{self.category} | {self.period_start} | {self.co2e_kg} kgCO2e"
