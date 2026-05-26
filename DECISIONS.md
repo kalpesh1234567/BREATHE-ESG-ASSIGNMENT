@@ -75,14 +75,34 @@ This matters because an MB51 export will contain **all** material movements for 
 
 When a flight record has origin/destination airport codes (IATA), I compute Great Circle Distance using the Haversine formula and apply a **9% routing uplift** (DEFRA's recommended factor to account for non-direct routes and holding patterns).
 
-The alternative is to use ICAO's official CO₂ calculator or a third-party API (Climatiq, myclimate). I chose Haversine + curated airport coordinates because:
-1. No external API dependency
-2. Fully auditable and reproducible
-3. For most major airports (which is what the Concur data shows), GCD accuracy is ±5%, well within the uncertainty of emission factors themselves
+**Why Haversine and not the Climatiq API or ICAO calculator?**
+
+- **Climatiq** is a paid API (metered pricing). Introducing a third-party API dependency into a prototype
+  adds cost, a network dependency, rate limits, and a service contract to explain to the client. Haversine
+  is free, deterministic, and produces identical results on every run — important for audit reproducibility.
+- **ICAO Carbon Offset Calculator** is a black box — you can't inspect or version the methodology. DEFRA
+  explicitly publishes its uplift assumptions. For a regulated audit trail, an auditor can verify any number
+  we produce.
+- **Accuracy:** For the major airport pairs in a typical Concur export (e.g., LHR→JFK, ORD→FRA),
+  Haversine with 9% uplift produces distances within ±3-5% of ICAO's output — well within the ±15%
+  uncertainty of flight emission factors themselves.
+- The curated airport coordinate table covers ~80 major hubs. For unlisted airports, the record is
+  flagged suspicious and co2e_kg is left null, forcing analyst review. This is honest and safe.
+
+**Why DEFRA 2024 over US EPA?**
+
+DEFRA is the international standard for Scope 3 travel (GHG Protocol Technical Guidance for Scope 3,
+Appendix C recommends DEFRA as a default). EPA does not publish per-PKM air travel factors in the same
+format. If the client is a US company that prefers EPA-aligned reporting, we'd switch the ground transport
+factors to EPA and keep DEFRA for aviation. This is a one-row change in the `EmissionFactor` table.
+
+**Radiative Forcing uplift:** I use DEFRA 2024 factors that **include 1.7× Radiative Forcing uplift**.
+RF accounts for the non-CO₂ warming effects of aviation at altitude (contrails, NOx). Some companies
+report with RF, some without. DEFRA recommends including it for Scope 3. This is documented in the
+emission factor `notes` field. If the client wants to exclude RF, we'd select the without-RF row
+(DEFRA publishes both).
 
 Where IATA codes cannot be extracted, the record is flagged as suspicious and co2e_kg is left null.
-
-**Radiative Forcing uplift:** I use DEFRA 2024 factors that **include 1.7× Radiative Forcing uplift**. RF accounts for the non-CO₂ warming effects of aviation at altitude (contrails, NOx). Some companies report with RF, some without. DEFRA recommends including it for Scope 3. This is documented in the emission factor `notes` field.
 
 ---
 
@@ -114,13 +134,50 @@ Out of scope for a prototype. In production: mandatory SSO via SAML (most enterp
 
 Prevents enumeration attacks across tenants. Slightly larger index size than integers — acceptable tradeoff.
 
-### `co2e_kg` stored but not locked until status=locked
+### `co2e_kg` stored and recalculated on analyst edits
 
-The field is computed and stored, but its value is only trusted for audit purposes once status = 'locked'. Before that, an analyst may edit the underlying quantity, and the CO₂e would need recalculation. In the current prototype, recalculation after edit is left as a future improvement — the analyst can note the recalculated value in the `flag_reason` field.
+The field is computed at ingestion time by multiplying `quantity_normalized` × `emission_factor_value`.
+The emission factor value is **snapshotted at ingestion time** onto the record — we do not do a live
+lookup at review time. This means if DEFRA updates its factor table next year, all historical records
+remain reproducible.
 
-**What I'd build next:** Trigger automatic CO₂e recalculation whenever `quantity_normalized` is edited.
+If an analyst corrects `quantity_normalized` (e.g., because the unit was wrong), **co2e_kg is automatically
+recalculated** in `perform_update()` using the already-snapshotted factor:
 
-### Scope 2 defaults to UK grid factor
+```python
+# In ActivityRecordDetailView.perform_update()
+new_qty = serializer.validated_data.get('quantity_normalized')
+if new_qty is not None and instance.emission_factor_value:
+    extra_fields['co2e_kg'] = (
+        Decimal(str(new_qty)) * instance.emission_factor_value
+    ).quantize(Decimal('0.0001'))
+```
+
+The recalculation is logged in the AuditLog `note` field: `"co2e recalculated from snapshotted emission factor"`.
+The original values (pre-edit) are preserved in `original_values` JSONField for full traceability.
+
+Records only become `locked` (audit-ready) after analyst approval — the `locked` status signals
+that the CO₂e value is trusted and the record is immutable.
+
+### Database-level CHECK constraints on `ActivityRecord`
+
+Beyond Django's application-layer validation, four `CHECK` constraints are enforced at the
+database level (PostgreSQL):
+
+```sql
+CHECK (period_end >= period_start)         -- period must be logically ordered
+CHECK (quantity_normalized >= 0)           -- negative raw values OK; normalized must not be
+CHECK (scope IN ('1', '2', '3'))           -- belt-and-suspenders beyond CharField choices
+CHECK (status IN ('pending','flagged','approved','rejected','locked'))
+```
+
+Rationale: if a future code path bypasses the serializer (bulk ORM update, data migration, shell
+command), these constraints catch bad data before it reaches the database. A `pending → approved`
+transition that accidentally wrote `scope = '4'` would fail loudly rather than silently.
+
+**What's not a constraint (and why):** `co2e_kg >= 0` is deliberately excluded — some reversal
+postings produce negative emissions adjustments, and we preserve those. The app layer flags them
+as suspicious rather than rejecting them at the DB level.
 
 The current emission factor seeding uses UK National Grid (0.207 kgCO₂e/kWh). In production, the correct factor depends on the physical location of each meter. The `EmissionFactor.region` field and `facility_code` (meter ID / service address) could be used to automatically select the right regional factor.
 
