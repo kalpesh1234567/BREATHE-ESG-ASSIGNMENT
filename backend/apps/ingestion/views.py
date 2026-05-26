@@ -3,6 +3,7 @@ Ingestion and activity record API views.
 All views are scoped to request.user.organization — multi-tenant isolation.
 """
 from datetime import datetime, timezone
+from decimal import Decimal
 from rest_framework import generics, status, filters
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
@@ -135,19 +136,32 @@ class ActivityRecordDetailView(OrgMixin, generics.RetrieveUpdateAPIView):
             'co2e_kg': str(instance.co2e_kg) if instance.co2e_kg else None,
         }
 
+        # ── CO₂e recalculation ────────────────────────────────────────────
+        # If the analyst corrected quantity_normalized, recompute co2e_kg
+        # using the snapshotted emission_factor_value already on the record.
+        # We use the snapshot (not a live lookup) so historical records
+        # remain reproducible even if the factor table is updated later.
+        extra_fields = {
+            'edited_by': self.request.user,
+            'edited_at': datetime.now(timezone.utc),
+        }
+
+        new_qty = serializer.validated_data.get('quantity_normalized')
+        if new_qty is not None and instance.emission_factor_value:
+            recalculated_co2e = (
+                Decimal(str(new_qty)) * instance.emission_factor_value
+            ).quantize(Decimal('0.0001'))
+            extra_fields['co2e_kg'] = recalculated_co2e
+        elif new_qty is not None and not instance.emission_factor_value:
+            # No factor available — null out co2e so it isn't silently stale
+            extra_fields['co2e_kg'] = None
+
         # Snapshot original values before first edit
         if not instance.is_edited:
-            serializer.save(
-                is_edited=True,
-                original_values=before,
-                edited_by=self.request.user,
-                edited_at=datetime.now(timezone.utc),
-            )
-        else:
-            serializer.save(
-                edited_by=self.request.user,
-                edited_at=datetime.now(timezone.utc),
-            )
+            extra_fields['is_edited'] = True
+            extra_fields['original_values'] = before
+
+        serializer.save(**extra_fields)
 
         AuditLog.objects.create(
             record=instance,
@@ -157,8 +171,10 @@ class ActivityRecordDetailView(OrgMixin, generics.RetrieveUpdateAPIView):
             after_state={
                 'quantity_raw': str(serializer.instance.quantity_raw),
                 'unit_raw': serializer.instance.unit_raw,
+                'quantity_normalized': str(serializer.instance.quantity_normalized),
                 'co2e_kg': str(serializer.instance.co2e_kg) if serializer.instance.co2e_kg else None,
             },
+            note='co2e recalculated from snapshotted emission factor' if new_qty is not None else '',
         )
 
 
